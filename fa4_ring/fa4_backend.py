@@ -5,13 +5,17 @@ We call the lower-level ``_flash_attn_fwd`` rather than the public autograd wrap
 
 1. Only ``_flash_attn_fwd`` exposes the FP8 ``q_descale/k_descale/v_descale`` knobs
    (the public wrappers drop them). Ring inference is forward-only, so we lose nothing.
-2. It accepts a pre-allocated ``lse`` and a fixed batched layout.
+2. It accepts ``cu_seqlens`` varlen inputs and a pre-allocated ``lse``.
+
+Calling convention mirrors the verified vllm CP ring (internal-rtp/vllm context_parallel
+ring.py): **3D varlen** ``[total, H, D]`` + ``cu_seqlens_q/k`` + ``max_seqlen_q/k`` — NOT
+4D batched. For the single-sequence-per-rank case we build ``cu_seqlens = [0, T]``.
 
 Important FA4 contract details (verified against flash_attn/cute/interface.py):
   * ``_flash_attn_fwd`` returns a **4-tuple** ``(out, lse, p, row_max)``; ``p`` and
     ``row_max`` are only non-None on the qv / sparse-MLA path (never used here).
-  * For the non-qv path the LSE is returned heads-major ``[..., nheads, seqlen]``; we
-    transpose to ``[seqlen, nheads]`` for FlashInfer's ``merge_state`` convention.
+  * varlen (no-qv) LSE is returned heads-major ``[nheads, total_q]``; we transpose to
+    ``[total_q, nheads]`` for FlashInfer's ``merge_state`` convention.
   * LSE is **natural log** (the bwd path multiplies by ``log2_e`` to get base-2), which
     is exactly what FlashInfer's mergers expect — no base conversion needed.
   * FP8 inputs produce a **bf16** output; FP8 descales must be float32 CUDA tensors of
@@ -77,18 +81,25 @@ def fa4_attn(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
 
+    t_q, t_k = q.shape[0], k.shape[0]
     h_kv = k.shape[1]
     qd = _norm_descale(q_descale, h_kv)
     kd = _norm_descale(k_descale, h_kv)
     vd = _norm_descale(v_descale, h_kv)
 
-    # FA4 accepts (batch, seqlen, H, D). Use batch=1 for the single chunk; this avoids
-    # building cu_seqlens for the common single-sequence-per-rank case.
-    # _flash_attn_fwd returns a 4-tuple (out, lse, p, row_max); p/row_max are MLA-only.
+    # 3D varlen calling convention (matches the verified vllm CP ring). Single sequence
+    # per rank -> cu_seqlens = [0, T]. _flash_attn_fwd returns a 4-tuple
+    # (out, lse, p, row_max); p/row_max are MLA-only and None here.
+    cu_q = torch.tensor([0, t_q], device=q.device, dtype=torch.int32)
+    cu_k = torch.tensor([0, t_k], device=q.device, dtype=torch.int32)
     out, lse, _p, _row_max = _fa4_fwd(
-        q.unsqueeze(0),
-        k.unsqueeze(0),
-        v.unsqueeze(0),
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=t_q,
+        max_seqlen_k=t_k,
         softmax_scale=softmax_scale,
         causal=causal,
         return_lse=True,
@@ -96,8 +107,6 @@ def fa4_attn(
         k_descale=kd,
         v_descale=vd,
     )
-    # out: [1, T_q, H, D] -> [T_q, H, D]
-    # lse: [1, H, T_q]    -> [T_q, H]
-    out = out.squeeze(0)
-    lse = lse.squeeze(0).transpose(0, 1).contiguous()
+    # out: [T_q, H, D]; lse: [H, T_q] -> [T_q, H]
+    lse = lse.transpose(0, 1).contiguous()
     return out, lse
