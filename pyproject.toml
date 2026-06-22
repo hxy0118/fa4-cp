@@ -1,0 +1,21 @@
+[project]
+name = "fa4-ring"
+version = "0.1.0"
+description = "Context-parallel causal ring attention on Dao FlashAttention-4 (CuTe DSL), FP8-capable"
+requires-python = ">=3.10"
+# Runtime deps are intentionally NOT pinned here because flash-attn-4 and flashinfer
+# must match the local CUDA/GPU toolchain; install them out-of-band:
+#   pip install "flash-attn-4[cu13]"      # Hopper/Blackwell
+#   pip install flashinfer-python          # for cascade.merge_state{,_in_place,s}
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+# convenience extras; versions resolved by your CUDA env
+gpu = ["flash-attn-4", "flashinfer-python"]
+
+[tool.setuptools.packages.find]
+include = ["fa4_ring*"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
