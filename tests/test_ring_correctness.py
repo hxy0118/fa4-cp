@@ -23,6 +23,17 @@ import torch.distributed as dist
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fa4_ring import RingConfig, ring_flash_attn, zigzag_shard, zigzag_unshard  # noqa: E402
 from fa4_ring.reference import full_causal_reference  # noqa: E402
+from fa4_ring.zigzag import zigzag_shard_varlen  # noqa: E402
+
+
+def _varlen_unshard(gathered, world, num_seqs, per):
+    """Reconstruct packed [N, H, D] from per-rank packed shards (num_seqs equal seqs)."""
+    local_per_seq = per // world
+    out_seqs = []
+    for i in range(num_seqs):
+        shards = [gathered[r][i * local_per_seq:(i + 1) * local_per_seq] for r in range(world)]
+        out_seqs.append(zigzag_unshard(shards, world))
+    return torch.cat(out_seqs, dim=0)
 
 
 def main():
@@ -34,6 +45,8 @@ def main():
     ap.add_argument("--merge", choices=["incremental", "batched"], default="incremental")
     ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     ap.add_argument("--ref", choices=["torch", "fa4"], default="fa4")
+    ap.add_argument("--num-seqs", type=int, default=1,
+                    help=">1 packs N equal sequences and exercises the varlen path")
     args = ap.parse_args()
 
     dist.init_process_group("nccl")
@@ -53,18 +66,39 @@ def main():
     v = torch.randn(N, Hkv, D, device=dev, dtype=dtype)
 
     cfg = RingConfig(cp_size=world, cp_rank=rank, causal=True, merge_mode=args.merge)
-    lq = zigzag_shard(q, rank, world)
-    lk = zigzag_shard(k, rank, world)
-    lv = zigzag_shard(v, rank, world)
 
-    local_out = ring_flash_attn(lq, lk, lv, cfg)  # [2h, H, D]
+    if args.num_seqs > 1:
+        # pack N equal sequences; each is zig-zag sharded independently (block-diagonal)
+        assert N % args.num_seqs == 0, "seqlen must divide num-seqs"
+        per = N // args.num_seqs
+        full_cu = torch.arange(0, N + 1, per, device=dev, dtype=torch.int32)
+        lq, local_cu = zigzag_shard_varlen(q, full_cu, rank, world)
+        lk, _ = zigzag_shard_varlen(k, full_cu, rank, world)
+        lv, _ = zigzag_shard_varlen(v, full_cu, rank, world)
+        max_local = int((local_cu[1:] - local_cu[:-1]).max())
+        local_out = ring_flash_attn(lq, lk, lv, cfg, cu_seqlens=local_cu, max_seqlen=max_local)
+    else:
+        lq = zigzag_shard(q, rank, world)
+        lk = zigzag_shard(k, rank, world)
+        lv = zigzag_shard(v, rank, world)
+        local_out = ring_flash_attn(lq, lk, lv, cfg)  # [2h, H, D]
 
     # gather all per-rank outputs and stitch
     gathered = [torch.empty_like(local_out) for _ in range(world)]
     dist.all_gather(gathered, local_out.contiguous())
     if rank == 0:
-        full_ring = zigzag_unshard(gathered, world).float()
-        ref = full_causal_reference(q, k, v, backend=args.ref).float()
+        if args.num_seqs > 1:
+            # reconstruct + compare each sequence independently (block-diagonal causal)
+            per = N // args.num_seqs
+            full_ring = _varlen_unshard(gathered, world, args.num_seqs, per).float()
+            ref = torch.cat([
+                full_causal_reference(q[i * per:(i + 1) * per], k[i * per:(i + 1) * per],
+                                      v[i * per:(i + 1) * per], backend=args.ref)
+                for i in range(args.num_seqs)
+            ], dim=0).float()
+        else:
+            full_ring = zigzag_unshard(gathered, world).float()
+            ref = full_causal_reference(q, k, v, backend=args.ref).float()
         max_err = (full_ring - ref).abs().max().item()
         mean_err = (full_ring - ref).abs().mean().item()
         cos = torch.nn.functional.cosine_similarity(

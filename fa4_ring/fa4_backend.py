@@ -56,17 +56,24 @@ def _norm_descale(d: Optional[torch.Tensor], h_kv: int) -> Optional[torch.Tensor
 
 
 def fa4_attn(
-    q: torch.Tensor,  # [T_q, H, D]
+    q: torch.Tensor,  # [T_q, H, D]      (varlen-packed)
     k: torch.Tensor,  # [T_k, H_kv, D]
     v: torch.Tensor,  # [T_k, H_kv, D]
     *,
     causal: bool,
     softmax_scale: Optional[float] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Single-sequence FA4 forward.
+    """Varlen FA4 forward.
+
+    ``cu_seqlens_q/k`` (int32 ``[num_seq+1]``) + ``max_seqlen_q/k`` describe the packed
+    sequences; if omitted they default to a single sequence ``[0, T]`` (single-seq case).
 
     Returns
     -------
@@ -82,24 +89,28 @@ def fa4_attn(
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
 
     t_q, t_k = q.shape[0], k.shape[0]
+    if cu_seqlens_q is None:
+        cu_seqlens_q = torch.tensor([0, t_q], device=q.device, dtype=torch.int32)
+        max_seqlen_q = t_q
+    if cu_seqlens_k is None:
+        cu_seqlens_k = torch.tensor([0, t_k], device=q.device, dtype=torch.int32)
+        max_seqlen_k = t_k
+
     h_kv = k.shape[1]
     qd = _norm_descale(q_descale, h_kv)
     kd = _norm_descale(k_descale, h_kv)
     vd = _norm_descale(v_descale, h_kv)
 
-    # 3D varlen calling convention (matches the verified vllm CP ring). Single sequence
-    # per rank -> cu_seqlens = [0, T]. _flash_attn_fwd returns a 4-tuple
-    # (out, lse, p, row_max); p/row_max are MLA-only and None here.
-    cu_q = torch.tensor([0, t_q], device=q.device, dtype=torch.int32)
-    cu_k = torch.tensor([0, t_k], device=q.device, dtype=torch.int32)
+    # 3D varlen calling convention (matches the verified vllm CP ring). _flash_attn_fwd
+    # returns a 4-tuple (out, lse, p, row_max); p/row_max are MLA-only and None here.
     out, lse, _p, _row_max = _fa4_fwd(
         q.contiguous(),
         k.contiguous(),
         v.contiguous(),
-        cu_seqlens_q=cu_q,
-        cu_seqlens_k=cu_k,
-        max_seqlen_q=t_q,
-        max_seqlen_k=t_k,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=causal,
         return_lse=True,

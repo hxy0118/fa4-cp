@@ -26,7 +26,20 @@ that never happens. Do not add a ``-inf``-on-some-rows partial before step 0.
 from typing import List
 
 import torch
-from flashinfer.cascade import merge_state_in_place, merge_states
+
+
+def _merge_state_in_place(v, s, v_other, s_other):
+    # Lazy import: flashinfer is a CUDA runtime dep; importing this module (e.g. for the
+    # zigzag helpers or CPU tests) must not require it.
+    from flashinfer.cascade import merge_state_in_place
+
+    merge_state_in_place(v, s, v_other, s_other)
+
+
+def _merge_states(v, s):
+    from flashinfer.cascade import merge_states
+
+    return merge_states(v, s)
 
 
 class IncrementalMerger:
@@ -44,7 +57,7 @@ class IncrementalMerger:
             self.lse = lse.clone()
         else:
             # merge (out, lse) INTO (self.out, self.lse), in place.
-            merge_state_in_place(self.out, self.lse, out, lse)
+            _merge_state_in_place(self.out, self.lse, out, lse)
 
     def result(self) -> torch.Tensor:
         assert self.out is not None, "no partials were added"
@@ -69,7 +82,7 @@ class BatchedMerger:
         # merge_states wants v:[seq, num_states, H, D], s:[seq, num_states, H]
         v = torch.stack(self.outs, dim=1).contiguous()
         s = torch.stack(self.lses, dim=1).contiguous()
-        out, _ = merge_states(v, s)
+        out, _ = _merge_states(v, s)
         return out
 
 

@@ -37,7 +37,7 @@ import torch.distributed as dist
 from .config import RingConfig
 from .fa4_backend import fa4_attn
 from .merge import make_merger
-from .zigzag import half_indices
+from .zigzag import get_half_index
 
 
 @dataclass
@@ -59,24 +59,37 @@ def _global_rank(group, r: int) -> int:
 
 
 def ring_flash_attn(
-    local_q: torch.Tensor,  # [2h, H, D]   (zig-zag local shard)
-    local_k: torch.Tensor,  # [2h, H_kv, D]
-    local_v: torch.Tensor,  # [2h, H_kv, D]
+    local_q: torch.Tensor,  # [T, H, D]   (zig-zag local shard; T = sum of 2*h_j)
+    local_k: torch.Tensor,  # [T, H_kv, D]
+    local_v: torch.Tensor,  # [T, H_kv, D]
     cfg: RingConfig,
     *,
     group: Optional["dist.ProcessGroup"] = None,
     descales: Optional[Descales] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,  # local int32 [num_seq+1]; None -> single seq
+    max_seqlen: Optional[int] = None,
 ) -> torch.Tensor:
-    """Run causal ring attention; returns this rank's local output ``[2h, H, D]``."""
+    """Run causal ring attention; returns this rank's local output ``[T, H, D]``.
+
+    Single sequence per rank: leave ``cu_seqlens=None`` (built as ``[0, T]``).
+    Multiple packed sequences: pass the LOCAL ``cu_seqlens`` (each entry already the
+    zig-zag ``2*h_j`` shard length) and ``max_seqlen`` (max local shard length).
+    """
     S = cfg.cp_size
     rank = cfg.cp_rank
     scale = cfg.softmax_scale
     dev = local_q.device
-    local_len = local_q.shape[0]
-    h = local_len // 2
-    assert local_len % 2 == 0, "local sequence must be even (zig-zag first/second half)"
+    total = local_q.shape[0]
 
-    first_idx, second_idx = half_indices(local_len, dev)
+    if cu_seqlens is None:
+        cu_seqlens = torch.tensor([0, total], device=dev, dtype=torch.int32)
+        max_seqlen = total
+    assert max_seqlen is not None, "max_seqlen required when cu_seqlens is given"
+
+    front_idx = get_half_index(cu_seqlens, front=True)   # early-half rows (-> half KV)
+    back_idx = get_half_index(cu_seqlens, front=False)    # late-half rows  (-> half Q)
+    half_cu = cu_seqlens // 2
+    half_max = max_seqlen // 2
 
     qd = descales.q if descales else None
 
@@ -96,6 +109,8 @@ def ring_flash_attn(
     out0, lse0 = fa4_attn(
         local_q, local_k, local_v,
         causal=True, softmax_scale=scale,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
         q_descale=qd, k_descale=kd(rank), v_descale=vd(rank),
     )
     merger.add(out0, lse0)
@@ -123,27 +138,31 @@ def ring_flash_attn(
         src = (rank - step) % S
         if step <= rank:
             # all local Q attend the first half (early) of the received KV
-            k_half = k.index_select(0, first_idx).contiguous()
-            v_half = v.index_select(0, first_idx).contiguous()
+            k_half = k.index_select(0, front_idx).contiguous()
+            v_half = v.index_select(0, front_idx).contiguous()
             o, l = fa4_attn(
                 local_q, k_half, v_half,
                 causal=False, softmax_scale=scale,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=half_cu,
+                max_seqlen_q=max_seqlen, max_seqlen_k=half_max,
                 q_descale=qd, k_descale=kd(src), v_descale=vd(src),
             )
             merger.add(o, l)
         else:
             # late-Q (second half) attends the full received KV
-            q_sec = local_q.index_select(0, second_idx).contiguous()
+            q_sec = local_q.index_select(0, back_idx).contiguous()
             o, l = fa4_attn(
                 q_sec, k, v,
                 causal=False, softmax_scale=scale,
+                cu_seqlens_q=half_cu, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=half_max, max_seqlen_k=max_seqlen,
                 q_descale=qd, k_descale=kd(src), v_descale=vd(src),
             )
-            out_full = local_q.new_zeros((local_len, o.shape[1], o.shape[2]), dtype=o.dtype)
-            lse_full = torch.full((local_len, o.shape[1]), float("-inf"),
+            out_full = local_q.new_zeros((total, o.shape[1], o.shape[2]), dtype=o.dtype)
+            lse_full = torch.full((total, o.shape[1]), float("-inf"),
                                   device=dev, dtype=torch.float32)
-            out_full.index_copy_(0, second_idx, o)
-            lse_full.index_copy_(0, second_idx, l)
+            out_full.index_copy_(0, back_idx, o)
+            lse_full.index_copy_(0, back_idx, l)
             merger.add(out_full, lse_full)
 
         # Block on the transfer, then adopt the received K/V for the next hop.

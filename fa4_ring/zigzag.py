@@ -60,3 +60,38 @@ def half_indices(local_len: int, device) -> tuple:
     first = torch.arange(0, h, device=device)
     second = torch.arange(h, local_len, device=device)
     return first, second
+
+
+def get_half_index(cu_seqlens: torch.Tensor, *, front: bool) -> torch.Tensor:
+    """Varlen generalization of :func:`half_indices`: long indices of the front (early)
+    or back (late) half of EACH packed sequence described by ``cu_seqlens`` (int32
+    ``[num_seq+1]``). Each local sequence is ``[first_half | second_half]`` so its
+    midpoint is ``(start+end)//2``."""
+    device = cu_seqlens.device
+    cu = cu_seqlens.tolist()
+    parts = []
+    for i in range(len(cu) - 1):
+        start, end = cu[i], cu[i + 1]
+        assert (end - start) % 2 == 0, "each local sequence length must be even (zig-zag)"
+        mid = (start + end) // 2
+        parts.append(torch.arange(start, mid, device=device) if front
+                     else torch.arange(mid, end, device=device))
+    return torch.cat(parts) if parts else torch.empty(0, dtype=torch.long, device=device)
+
+
+def zigzag_shard_varlen(x: torch.Tensor, full_cu_seqlens, cp_rank: int, cp_size: int):
+    """Shard multiple packed sequences zig-zag for this rank.
+
+    ``x``: [sum(N_j), ...] packed; ``full_cu_seqlens``: int list/tensor [num_seq+1] of the
+    FULL (un-sharded) sequence boundaries. Returns (local_packed, local_cu_seqlens) where
+    local_cu_seqlens describes this rank's ``2*h_j`` per-sequence shards.
+    """
+    cu = full_cu_seqlens.tolist() if torch.is_tensor(full_cu_seqlens) else list(full_cu_seqlens)
+    shards, local_cu = [], [0]
+    for j in range(len(cu) - 1):
+        seg = x[cu[j]:cu[j + 1]]
+        loc = zigzag_shard(seg, cp_rank, cp_size)
+        shards.append(loc)
+        local_cu.append(local_cu[-1] + loc.shape[0])
+    local = torch.cat(shards, dim=0).contiguous() if shards else x.new_empty((0,) + x.shape[1:])
+    return local, torch.tensor(local_cu, dtype=torch.int32, device=x.device)

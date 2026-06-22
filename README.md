@@ -6,9 +6,17 @@ FlashAttention-4** (CuTe DSL). Unlike FlashInfer's `parallel_attention` (bf16-on
 no causal) and rtp-llm's CP ring (bf16-only), this path keeps **FP8 KV** end-to-end by
 routing through FA4's `_flash_attn_fwd` descale knobs.
 
-> Status: **v1, forward-only (inference), single-sequence-per-rank.** bf16/fp16 verified
-> by CPU algorithm simulation; FP8 + multi-GPU paths require a Hopper/Blackwell box to
-> validate (see Testing). FA4 itself is beta (`flash-attn-4 4.0.0bN`).
+> Status: **v1, forward-only (inference).** Supports single-sequence and **packed varlen
+> (multi-sequence)** per rank. The ring algorithm (zig-zag + 3-pattern + online-softmax
+> merge, single & varlen) is **CPU-validated against dense causal attention** (err ~1e-7,
+> incl. GQA/MQA); the FA4 kernel call + NCCL multi-GPU + FP8 paths require a
+> Hopper/Blackwell box to validate. FA4 itself is beta (`flash-attn-4 4.0.0bN`).
+>
+> ⚠️ **Qwen3.5 note:** Qwen3.5 is `qwen3_next_vl` = **3:1 linear-attn(GDN) : full-attn**.
+> This module rings the **full-attention layers only** (≈15/60). The **GDN/linear-attn
+> layers cannot ring** (they are recurrences) and need a separate CP scheme (all-gather
+> or chunked-scan state hand-off). So fa4_ring is necessary-but-not-sufficient for
+> end-to-end Qwen3.5 prefill-CP. See "Qwen3.5 / CP support" below.
 
 ## Why ring CP does NOT blow up KV memory
 Ring CP shards KV by **sequence** (each rank stores only its `1/cp_size` slice). During
@@ -37,6 +45,19 @@ lq, lk, lv = (zigzag_shard(t, rank, world) for t in (q, k, v))
 
 cfg = RingConfig(cp_size=world, cp_rank=rank, causal=True, merge_mode="incremental")
 local_out = ring_flash_attn(lq, lk, lv, cfg)   # [2h, H, D]
+```
+
+### Packed varlen (multiple sequences per rank)
+```python
+from fa4_ring import ring_flash_attn
+from fa4_ring.zigzag import zigzag_shard_varlen
+
+# full_cu = [0, N0, N0+N1, ...] FULL (unsharded) sequence boundaries
+lq, local_cu = zigzag_shard_varlen(q, full_cu, rank, world)   # each seq zig-zag sharded
+lk, _ = zigzag_shard_varlen(k, full_cu, rank, world)
+lv, _ = zigzag_shard_varlen(v, full_cu, rank, world)
+max_local = int((local_cu[1:] - local_cu[:-1]).max())
+out = ring_flash_attn(lq, lk, lv, cfg, cu_seqlens=local_cu, max_seqlen=max_local)
 ```
 
 ### FP8 KV (Blackwell)
@@ -78,9 +99,21 @@ Faithful port of rtp-llm's verified `PCPAll2AllAttnOp` zig-zag ring onto FA4:
   handles' `req.wait()` (not CUDA-stream events — `batch_isend_irecv` runs on NCCL's own
   stream, so a side-stream event would not track data arrival).
 
+## Qwen3.5 / CP support (important)
+- **Mainline vLLM / FlashInfer / rtp-llm rings are all bf16** (no FP8 KV). The ring
+  prefill-CP wired in `internal-rtp/vllm` is for **MLA / DeepSeek-v2** only
+  (`mla/common.py` → `context_parallel/ring.py`); **Qwen3.5 (`qwen3_next_vl`) has no CP
+  wiring** there (`supports_pcp` defaults False). Full Qwen3.5 prefill-CP existed only on
+  an abandoned branch. So "vLLM supports prefill-CP" = yes for DeepSeek, **not** Qwen3.5.
+- For **Qwen3.5** specifically you need TWO CP schemes: this ring for the full-attn layers,
+  **plus** a linear-attn (GDN) CP for the other ~45/60 layers (rtp does this via zig-zag
+  position extract + all-gather + causal-conv1d state metadata). fa4_ring covers the first.
+
 ## Known limitations (v1)
-- causal only; single sequence per rank (no varlen batch / no paged KV yet).
+- causal only. Supports single-seq and packed varlen; **no paged KV** yet (rotated KV is
+  contiguous ragged).
 - forward-only (inference). No backward (we call FA4's `_flash_attn_fwd`).
 - FP8 path is wired but unverified on HW; FA4 FP8-KV is Blackwell-first (on Hopper sm90
   it is a known gap — FlashInfer issue #3327).
-- requires `flashinfer-python` for the mergers (only the `cascade` ops are used).
+- requires `flashinfer-python` for the mergers (imported lazily; only the `cascade` ops
+  are used). The package imports fine without it — you only need it at merge time.
