@@ -82,6 +82,9 @@ It is hardware-dependent — run `bench/bench_merge.py` to pick on your box.
 # CPU: validates the algorithm (zig-zag + 3-pattern + merge) — no GPU needed
 python tests/test_zigzag.py
 python tests/test_algorithm_cpu.py
+# GDN CP (Plan A) — CPU + CPU-multiproc (gloo), no GPU kernel needed
+python tests/test_gdn_cp_cpu.py
+torchrun --nproc_per_node=4 tests/test_gdn_cp_dist.py --backend gloo
 
 # GPU: ring == dense causal attention (needs >=2 Hopper/Blackwell GPUs + flash-attn-4)
 torchrun --nproc_per_node=4 tests/test_ring_correctness.py
@@ -105,9 +108,33 @@ Faithful port of rtp-llm's verified `PCPAll2AllAttnOp` zig-zag ring onto FA4:
   (`mla/common.py` → `context_parallel/ring.py`); **Qwen3.5 (`qwen3_next_vl`) has no CP
   wiring** there (`supports_pcp` defaults False). Full Qwen3.5 prefill-CP existed only on
   an abandoned branch. So "vLLM supports prefill-CP" = yes for DeepSeek, **not** Qwen3.5.
-- For **Qwen3.5** specifically you need TWO CP schemes: this ring for the full-attn layers,
-  **plus** a linear-attn (GDN) CP for the other ~45/60 layers (rtp does this via zig-zag
-  position extract + all-gather + causal-conv1d state metadata). fa4_ring covers the first.
+- For **Qwen3.5** you need TWO CP schemes: this ring for the full-attn layers, **plus** a
+  linear-attn (GDN) CP for the other ~45/60 layers. **Both are now in this repo** — see
+  `fa4_ring/gdn_cp/` (Plan A, below). They share **one zig-zag sharding** for the whole model.
+
+## GDN (linear-attention) context parallelism — `fa4_ring/gdn_cp/`
+Qwen3.5's GDN/gated-delta-net layers are a **recurrence** (`S = exp(g)·S + β·kᵀ(v−S k)`,
+`o = S q`), so ring (KV rotation) does not apply. **Plan A (default, ported from rtp-llm):**
+all-gather the projected GDN inputs, replicate the scan on the full sequence, extract this
+rank's zig-zag-local output. Compatible with the ring's zig-zag sharding; GDN is O(N) so
+replicating it is cheap vs the O(N²) full-attn ring win.
+
+```python
+from fa4_ring.gdn_cp import build_gdn_cp_metadata, gdn_cp_allgather
+
+meta = build_gdn_cp_metadata(full_seq_lens, cp_size=world, cp_rank=rank, device=dev)
+local_packed = my_projected_gdn_inputs            # [L, F] = cat([mixed_qkv, b, a], -1)
+local_out = gdn_cp_allgather(local_packed, scan_fn, meta)   # [L, Hv, Dv]
+# scan_fn(natural[total,F], full_cu) runs conv1d + fused_gdn_gating + chunk_gated_delta_rule
+# on GPU (see allgather_cp.build_gpu_scan_fn docstring); on CPU use gdn_reference.
+```
+- `metadata.py` zig-zag restore/extract indices (verified to match `fa4_ring.zigzag_shard`).
+- `reference.py` pure-torch gated-delta-rule (CPU ground truth, matches the fla kernel math).
+- `state_passing.py` Plan B skeleton (sequential state-passing, v2 — true compute CP,
+  needs contiguous sharding; only if Plan A's replicate-scan becomes the bottleneck).
+- **CPU-validated** (`tests/test_gdn_cp_cpu.py`, `test_gdn_cp_dist.py --backend gloo`):
+  metadata==zigzag, restore==natural, and CP-output == single-device scan (`max_err=0`).
+- GPU TODO: wire the real `chunk_gated_delta_rule` + `causal_conv1d_fn` as `scan_fn`.
 
 ## Known limitations (v1)
 - causal only. Supports single-seq and packed varlen; **no paged KV** yet (rotated KV is
