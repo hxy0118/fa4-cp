@@ -15,12 +15,15 @@ ring to us by then):
     local Q** can see it: non-causal ``attn(q=local_q[h:], k=remote_k)`` merged into the
     late rows.
 
-Communication (verified-correct pattern; no manual CUDA streams/events):
-each step forwards the *current* K/V one hop around the ring (send to ``rank+1``, recv
-from ``rank-1``) into **freshly allocated** receive buffers, overlapping the in-flight
-transfer with this step's attention, then ``req.wait()`` before swapping. NCCL's
-``batch_isend_irecv`` completion is tracked via the returned work handles — recording a
-CUDA event on a side stream the transfer never ran on would NOT track data arrival.
+Communication (no manual CUDA streams/events):
+the KV chains one hop per step (send to ``rank+1``, recv from ``rank-1``) into
+**freshly allocated** receive buffers. The block used at step ``s`` must originate on
+``src = (rank - s) % S``, so we ``req.wait()`` + swap to the received block *before*
+computing step ``s`` (computing against the pre-rotation block was an off-by-one). To
+keep the transfer overlapped, step ``s`` prefetches step ``s+1``'s block and runs its
+attention while that hop is in flight. NCCL's ``batch_isend_irecv`` completion is
+tracked via the returned work handles — recording a CUDA event on a side stream the
+transfer never ran on would NOT track data arrival.
 
 Memory note: a rank only ever holds its own ``1/cp_size`` KV shard plus one in-flight
 receive buffer — never the full KV. Ring CP *reduces* per-GPU KV pressure (it does not
@@ -118,22 +121,38 @@ def ring_flash_attn(
     if S == 1:
         return merger.result()
 
-    # ---- ring rotation (chain forward, overlapped) ----
+    # ---- ring rotation (chain forward, compute overlapped with the NEXT hop) ----
     g_send = _global_rank(group, (rank + 1) % S)
     g_recv = _global_rank(group, (rank - 1) % S)
 
-    k, v = local_k, local_v
-    reqs = None
-    for step in range(1, S):
-        # Receive the next hop's K/V into FRESH buffers while we compute this step.
-        next_k = torch.empty_like(k)
-        next_v = torch.empty_like(v)
-        reqs = dist.batch_isend_irecv([
-            dist.P2POp(dist.isend, k, g_send, group=group),
-            dist.P2POp(dist.irecv, next_k, g_recv, group=group),
-            dist.P2POp(dist.isend, v, g_send, group=group),
-            dist.P2POp(dist.irecv, next_v, g_recv, group=group),
+    def _rotate(cur_k, cur_v):
+        # Forward the current K/V one hop (send to rank+1, recv from rank-1) into FRESH
+        # buffers. Returns the receive buffers and the in-flight NCCL work handles.
+        nk = torch.empty_like(cur_k)
+        nv = torch.empty_like(cur_v)
+        rq = dist.batch_isend_irecv([
+            dist.P2POp(dist.isend, cur_k, g_send, group=group),
+            dist.P2POp(dist.irecv, nk, g_recv, group=group),
+            dist.P2POp(dist.isend, cur_v, g_send, group=group),
+            dist.P2POp(dist.irecv, nv, g_recv, group=group),
         ])
+        return nk, nv, rq
+
+    # The KV block held at loop-iteration ``step`` must be the one that originated on
+    # ``src = (rank - step) % S`` (it has chained ``step`` hops around the ring to us).
+    # Step 0 (own KV, src == rank) is already merged above, so prime the pipeline by
+    # fetching step-1's block first; there is nothing to overlap that first hop with.
+    # Thereafter, prefetch step+1's block so its transfer overlaps step's attention.
+    k, v = local_k, local_v
+    next_k, next_v, reqs = _rotate(k, v)
+    for step in range(1, S):
+        for req in reqs:
+            req.wait()
+        k, v = next_k, next_v  # now originates from src = (rank - step)
+        if step + 1 < S:
+            # Prefetch the next hop; sends the current k/v (read-only here) onward while
+            # this step's attention runs. Kept alive until the wait() at the next iter top.
+            next_k, next_v, reqs = _rotate(k, v)
 
         src = (rank - step) % S
         if step <= rank:
@@ -164,11 +183,5 @@ def ring_flash_attn(
             out_full.index_copy_(0, back_idx, o)
             lse_full.index_copy_(0, back_idx, l)
             merger.add(out_full, lse_full)
-
-        # Block on the transfer, then adopt the received K/V for the next hop.
-        for req in reqs:
-            req.wait()
-        k, v = next_k, next_v
-        reqs = None
 
     return merger.result()

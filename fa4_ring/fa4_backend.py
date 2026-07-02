@@ -16,8 +16,9 @@ Important FA4 contract details (verified against flash_attn/cute/interface.py):
     ``row_max`` are only non-None on the qv / sparse-MLA path (never used here).
   * varlen (no-qv) LSE is returned heads-major ``[nheads, total_q]``; we transpose to
     ``[total_q, nheads]`` for FlashInfer's ``merge_state`` convention.
-  * LSE is **natural log** (the bwd path multiplies by ``log2_e`` to get base-2), which
-    is exactly what FlashInfer's mergers expect — no base conversion needed.
+  * LSE is **natural log** (the bwd path multiplies by ``log2_e`` to get base-2). NOTE:
+    FlashInfer's ``cascade`` mergers expect **base-2** LSE, so :mod:`fa4_ring.merge`
+    scales by ``log2(e)`` before every FlashInfer call (do not pre-convert here).
   * FP8 inputs produce a **bf16** output; FP8 descales must be float32 CUDA tensors of
     shape ``(batch_size, num_head_kv) == (1, H_kv)`` for all three of q/k/v_descale.
 """
